@@ -25,7 +25,7 @@ Usage:
     --end 2026-05-31
 
 Dependencies:
-  python -m pip install pandas git+https://github.com/druzsan/justetf-scraping.git
+  python -m pip install -r requirements.txt
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ import argparse
 import csv
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -45,7 +46,7 @@ try:
 except ImportError as exc:
     raise SystemExit(
         "Missing justetf_scraping library. Install dependencies with:\n"
-        "python -m pip install pandas git+https://github.com/druzsan/justetf-scraping.git"
+        "python -m pip install -r requirements.txt"
     ) from exc
 
 
@@ -72,7 +73,7 @@ def read_instruments(path: Path) -> list[Instrument]:
     cols = {c.lower().strip(): c for c in df.columns}
 
     if "ticker" not in cols:
-        raise ValueError("The instruments CSV file must contain a 'ticker' column.")
+        raise ValueError(f"{path} must contain a 'ticker' column.")
 
     isin_col = None
     for candidate in ("isin_or_url", "isin", "url", "link"):
@@ -81,21 +82,58 @@ def read_instruments(path: Path) -> list[Instrument]:
             break
     if isin_col is None:
         raise ValueError(
-            "The instruments CSV file must contain one of these columns: "
+            f"{path} must contain one of these columns: "
             "isin_or_url, isin, url, link."
         )
 
     instruments: list[Instrument] = []
-    for _, row in df.iterrows():
+    for row_number, (_, row) in enumerate(df.iterrows(), start=2):
         ticker = str(row[cols["ticker"]]).strip().upper()
-        isin = extract_isin(str(row[isin_col]))
+        if pd.isna(row[cols["ticker"]]) or not ticker:
+            raise ValueError(f"{path}, row {row_number}: ticker must not be blank.")
+        try:
+            isin = extract_isin(str(row[isin_col]))
+        except ValueError as exc:
+            raise ValueError(f"{path}, row {row_number}: {exc}") from exc
         instruments.append(Instrument(ticker=ticker, isin=isin))
+
+    if not instruments:
+        raise ValueError(f"{path} does not contain any instruments.")
+
+    tickers = [instrument.ticker for instrument in instruments]
+    duplicates = sorted({ticker for ticker in tickers if tickers.count(ticker) > 1})
+    if duplicates:
+        raise ValueError(f"{path} contains duplicate ticker(s): {', '.join(duplicates)}.")
     return instruments
 
 
-def load_chart_for_instrument(instrument: Instrument, unclosed: bool = False) -> pd.DataFrame:
+def load_chart_for_instrument(
+    instrument: Instrument, unclosed: bool = False, retries: int = 3
+) -> pd.DataFrame:
     """Download chart data from JustETF and return date, ticker, and price."""
-    chart = justetf_scraping.load_chart(instrument.isin, unclosed=unclosed)
+    attempts = max(1, retries)
+    chart = None
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            chart = justetf_scraping.load_chart(instrument.isin, unclosed=unclosed)
+            break
+        except Exception as exc:  # network/library errors vary by scraper version
+            last_error = exc
+            if attempt == attempts:
+                raise ValueError(
+                    f"Unable to download data for {instrument.ticker} after "
+                    f"{attempts} attempt(s): {exc}"
+                ) from exc
+            print(
+                f"[WARNING] Download attempt {attempt}/{attempts} failed for "
+                f"{instrument.ticker}; retrying...",
+                file=sys.stderr,
+            )
+            time.sleep(1)
+
+    if last_error is not None and chart is None:
+        raise ValueError(f"Unable to download data for {instrument.ticker}: {last_error}")
     if chart is None or chart.empty:
         raise ValueError(f"No data downloaded for {instrument.ticker} ({instrument.isin}).")
 
@@ -150,9 +188,14 @@ def normalize_weight(value) -> Optional[float]:
     s = str(value).strip().replace("%", "").replace(",", ".")
     if not s:
         return None
-    number = float(s)
+    try:
+        number = float(s)
+    except ValueError as exc:
+        raise ValueError(f"Invalid weight value: {value!r}") from exc
     if number > 1:
         number = number / 100.0
+    if not 0 <= number <= 1:
+        raise ValueError(f"Weight must be between 0% and 100%: {value!r}")
     return number
 
 
@@ -172,13 +215,39 @@ def attach_weights(returns: pd.DataFrame, weights_path: Optional[Path], benchmar
     required = {"date", "ticker", "weight"}
     missing = required.difference(weights.columns)
     if missing:
-        raise ValueError(f"weights.csv is missing required columns: {sorted(missing)}")
+        raise ValueError(f"{weights_path} is missing required columns: {sorted(missing)}")
+
+    for row_number, (ticker, date) in enumerate(zip(weights["ticker"], weights["date"]), start=2):
+        if pd.isna(ticker) or not str(ticker).strip():
+            raise ValueError(f"{weights_path}, row {row_number}: ticker must not be blank.")
+        if pd.isna(pd.to_datetime(date, errors="coerce")):
+            raise ValueError(f"{weights_path}, row {row_number}: invalid date value {date!r}.")
 
     weights["ticker"] = weights["ticker"].astype(str).str.upper().str.strip()
     weights["date"] = pd.to_datetime(weights["date"], errors="coerce")
     weights["month"] = weights["date"].dt.to_period("M")
+    for row_number, value in enumerate(weights["weight"], start=2):
+        try:
+            normalize_weight(value)
+        except ValueError as exc:
+            raise ValueError(f"{weights_path}, row {row_number}: {exc}") from exc
     weights["weight_decimal"] = weights["weight"].apply(normalize_weight)
     weights = weights.dropna(subset=["ticker", "month", "weight_decimal"])
+
+    totals = weights.groupby("month")["weight_decimal"].sum()
+    for month, total in totals.items():
+        if not 0.9995 <= total <= 1.0005:
+            print(
+                f"[WARNING] {weights_path}: weights for {month} total "
+                f"{format_percent(total)} instead of 100%.",
+                file=sys.stderr,
+            )
+
+    duplicate_weights = weights.duplicated(["ticker", "month"], keep=False)
+    if duplicate_weights.any():
+        duplicates = weights.loc[duplicate_weights, ["ticker", "month"]].drop_duplicates()
+        labels = ", ".join(f"{row.ticker} ({row.month})" for row in duplicates.itertuples())
+        raise ValueError(f"{weights_path} contains duplicate ticker/month entries: {labels}.")
 
     df = df.merge(weights[["ticker", "month", "weight_decimal"]], on=["ticker", "month"], how="left")
     df["weight"] = df["weight_decimal"].apply(lambda x: "" if pd.isna(x) else f"{x:.0%}")
@@ -195,6 +264,23 @@ def format_percent(value: float) -> str:
     return f"{value * 100:.2f}%".replace(".", ",")
 
 
+def ensure_output_directory(output_path: Path) -> None:
+    """Create the output directory, or explain why it cannot be used."""
+    parent = output_path.parent
+    if parent.exists() and not parent.is_dir():
+        raise ValueError(f"Output directory is not a directory: {parent}")
+    parent.mkdir(parents=True, exist_ok=True)
+
+
+def print_completion_summary(output_path: Path, output: pd.DataFrame) -> None:
+    if output.empty:
+        coverage = "no monthly returns in the selected date range"
+    else:
+        dates = pd.to_datetime(output["date"], format="%d/%m/%Y")
+        coverage = f"coverage={dates.min():%d/%m/%Y} to {dates.max():%d/%m/%Y}"
+    print(f"[SUCCESS] Created {output_path}: rows={len(output)}, {coverage}.", file=sys.stderr)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Calculate monthly returns from JustETF link/ISIN input.")
     parser.add_argument("--instruments", required=True, help="CSV with ticker and JustETF link/ISIN")
@@ -204,15 +290,25 @@ def main() -> int:
     parser.add_argument("--end", help="End date inclusive, e.g. 2026-05-31")
     parser.add_argument("--unclosed", action="store_true", help="Include the current unclosed day")
     parser.add_argument("--benchmark-mode", action="store_true", help="Format output as benchmark data")
+    parser.add_argument("--retries", type=int, default=3, help="Download attempts per instrument (default: 3)")
     args = parser.parse_args()
 
-    instruments = read_instruments(Path(args.instruments))
+    instruments_path = Path(args.instruments)
+    output_path = Path(args.output)
+    instruments = read_instruments(instruments_path)
+    ensure_output_directory(output_path)
     ticker_order = {instrument.ticker: index for index, instrument in enumerate(instruments)}
 
     all_prices = []
-    for instrument in instruments:
-        print(f"Downloading {instrument.ticker} ({instrument.isin})...", file=sys.stderr)
-        all_prices.append(load_chart_for_instrument(instrument, unclosed=args.unclosed))
+    for index, instrument in enumerate(instruments, start=1):
+        print(
+            f"[INFO] Downloading {index}/{len(instruments)}: "
+            f"{instrument.ticker} ({instrument.isin})...",
+            file=sys.stderr,
+        )
+        all_prices.append(
+            load_chart_for_instrument(instrument, unclosed=args.unclosed, retries=args.retries)
+        )
 
     prices = pd.concat(all_prices, ignore_index=True)
 
@@ -245,10 +341,14 @@ def main() -> int:
     output["_ticker_sort"] = output["ticker"].map(ticker_order)
     output = output.sort_values(["_date_sort", "_ticker_sort"]).drop(columns=["_date_sort", "_ticker_sort"])
 
-    output.to_csv(args.output, index=False, quoting=csv.QUOTE_MINIMAL)
-    print(f"Created {args.output} with {len(output)} rows.", file=sys.stderr)
+    output.to_csv(output_path, index=False, quoting=csv.QUOTE_MINIMAL)
+    print_completion_summary(output_path, output)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (FileNotFoundError, OSError, ValueError, pd.errors.ParserError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc

@@ -8,5 +8,13 @@
 __pycache__/
 *.py[cod]
 
+# Local environment configuration
+.env
+.env.*
+!.env.example
+
+# Generated return-history data
+output/db_History*.csv
+
 # macOS metadata
 .DS_Store

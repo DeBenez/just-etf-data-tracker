@@ -43,12 +43,13 @@ avoids publishing a partial current-month result.
 
 - Python 3
 - Internet access to download market data and dependencies
-- `pandas`
-- [`justetf-scraping`](https://github.com/druzsan/justetf-scraping)
+- Dependencies listed in `requirements.txt` (`pandas` and
+  [`justetf-scraping`](https://github.com/druzsan/justetf-scraping))
 
 The included runner creates a local `.venv` virtual environment and installs
-the Python dependencies automatically. Its calculation of the previous
-month's last day uses macOS `date` syntax, so it is intended for macOS.
+the Python dependencies automatically on its first run. Its calculation of
+the previous month's last day uses macOS `date` syntax, so it is intended for
+macOS (not Linux or Windows).
 
 ## Quick start
 
@@ -59,15 +60,51 @@ chmod +x run_returns.sh
 ./run_returns.sh
 ```
 
+The runner also accepts optional settings:
+
+```bash
+./run_returns.sh --start 2025-01-01 --end 2025-12-31 \
+  --output-dir output/2025 --retries 4
+```
+
+`--output-dir` changes where both generated files are written. `--retries`
+controls download attempts per instrument and defaults to `3`.
+
 The command will:
 
 - create `.venv` if needed;
-- install or update the dependencies;
+- install dependencies from `requirements.txt` when it creates `.venv`;
 - update `output/db_HistoryMonthly.csv` from `input/instruments.csv` and `input/weights.csv`;
 - update `output/db_HistoryBenchmark.csv` from `input/benchmark_instruments.csv`.
 
 If `input/weights.csv` is not present, portfolio returns are still produced, but the
 weight and portfolio-contribution fields are empty.
+
+Later runs reuse the existing environment and do not update dependencies. To
+update them deliberately, run:
+
+```bash
+.venv/bin/python -m pip install --upgrade -r requirements.txt
+```
+
+## Terminal feedback
+
+The runner uses readable status markers that work in a terminal and in saved
+logs. During a normal run, you will see setup progress, one download line per
+instrument, a summary for each generated file, and a final file list:
+
+```text
+[INFO] Generating portfolio returns...
+[INFO] Downloading 1/4: XDEM (IE00BL25JP72)...
+[SUCCESS] Created output/db_HistoryMonthly.csv: rows=..., coverage=... to ...
+[SUCCESS] Run complete. Generated files:
+  - output/db_HistoryMonthly.csv
+  - output/db_HistoryBenchmark.csv
+```
+
+`[WARNING]` messages describe a recoverable condition, such as a missing
+optional weights file. `[ERROR]` messages explain why a run stopped and point
+to the relevant file or value where possible.
 
 ## Input files
 
@@ -81,7 +118,8 @@ XDEM,https://www.justetf.com/it/etf-profile.html?isin=IE00BL25JP72
 MVOL,IE00B8FHGS14
 ```
 
-- `ticker`: your short label for the instrument. It is normalized to uppercase.
+- `ticker`: your short label for the instrument. It is normalized to uppercase
+  and must be non-empty and unique within the file.
 - `isin_or_url`: either an ISIN or a JustETF URL containing an ISIN.
 
 The second column may also be named `isin`, `url`, or `link`.
@@ -98,10 +136,15 @@ date,ticker,weight
   program matches weights by calendar month.
 - `ticker`: must match the corresponding portfolio ticker.
 - `weight`: accepts percentage values (`56%`), decimal percentages (`56`), or
-  fractions (`0.56`). Commas are accepted as decimal separators.
+  fractions (`0.56`). Commas are accepted as decimal separators; values must
+  be between `0%` and `100%`.
 
 Add one row per instrument for every month whose portfolio contribution you
 want calculated.
+
+The program prints a warning when the supplied weights for a month do not add
+up to `100%`. It continues processing so that intentionally partial allocations
+remain usable.
 
 ### Benchmark instruments — `input/benchmark_instruments.csv`
 
@@ -145,7 +188,7 @@ to suit locales that use this convention.
 Install the dependencies in your preferred environment:
 
 ```bash
-python3 -m pip install pandas git+https://github.com/druzsan/justetf-scraping.git
+python3 -m pip install -r requirements.txt
 ```
 
 Generate portfolio data:
@@ -174,6 +217,7 @@ Optional flags:
 
 - `--start YYYY-MM-DD` and `--end YYYY-MM-DD` limit the source data range.
 - `--unclosed` includes the current, potentially incomplete trading day.
+- `--retries N` controls download attempts per instrument (default: `3`).
 - Omit `--weights` to export unweighted portfolio instrument returns.
 - `--benchmark-mode` sets the benchmark-specific output layout.
 
@@ -189,7 +233,11 @@ input/                        # Configuration and source CSV files
 output/                       # Generated CSV files
 ├── db_HistoryMonthly.csv     # Portfolio history
 └── db_HistoryBenchmark.csv   # Benchmark history
+examples/                     # Small illustrative output samples
 ```
+
+The `examples/` files show the expected output shape without containing live
+market data.
 
 ## Notes and limitations
 
@@ -199,3 +247,29 @@ output/                       # Generated CSV files
   month, which can be earlier than calendar month-end when markets are closed.
 - This project is a data utility, not investment advice. Validate results
   before using them for investment, tax, or accounting decisions.
+
+## Troubleshooting
+
+- **`python3 was not found`**: install Python 3, then run the script again.
+- **Missing dependency error**: run
+  `.venv/bin/python -m pip install --upgrade -r requirements.txt` from the
+  project folder. If `.venv` does not exist, run `./run_returns.sh` first.
+- **Invalid CSV error**: check the named file, row, and column. Instrument
+  tickers must be unique; weights must contain one row per ticker and month.
+- **No data downloaded**: confirm that the ISIN is valid and that your network
+  can reach JustETF. Availability of an instrument's historical data is
+  controlled by JustETF and `justetf-scraping`. The program retries temporary
+  download failures; use `--retries` to adjust this behavior.
+
+## Tests
+
+Run the local unit and syntax checks with:
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile calculate_justetf_returns.py
+bash -n run_returns.sh
+```
+
+The same checks run automatically in GitHub Actions for pushes and pull
+requests.
